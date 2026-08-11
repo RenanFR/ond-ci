@@ -11,6 +11,7 @@ MAX_DIFF_CHARS = 80000
 MAX_CONVENTIONS_CHARS = 20000
 
 GITHUB_API = "https://api.github.com"
+CHECK_NAME = "ai-review"
 
 
 def load_event():
@@ -140,11 +141,27 @@ def submit_review(repo_full_name, pull_number, token, event, body):
     response.raise_for_status()
 
 
+def submit_check_run(repo_full_name, head_sha, token, verdict, body):
+    conclusion = "success" if verdict == "APPROVE" else "failure"
+    title = "Aprovado" if verdict == "APPROVE" else "Mudanças solicitadas"
+    url = f"{GITHUB_API}/repos/{repo_full_name}/check-runs"
+    payload = {
+        "name": CHECK_NAME,
+        "head_sha": head_sha,
+        "status": "completed",
+        "conclusion": conclusion,
+        "output": {"title": title, "summary": body},
+    }
+    response = requests.post(url, headers=github_headers(token), json=payload, timeout=30)
+    response.raise_for_status()
+
+
 def main():
     event = load_event()
     pull_request = event["pull_request"]
     repo_full_name = event["repository"]["full_name"]
     pull_number = pull_request["number"]
+    head_sha = pull_request["head"]["sha"]
     token = os.environ["GITHUB_TOKEN"]
 
     diff = fetch_diff(repo_full_name, pull_number, token)
@@ -163,7 +180,8 @@ def main():
 
     body = format_review_body(review)
     submit_review(repo_full_name, pull_number, token, verdict, body)
-    print(f"Review postado: {verdict}")
+    submit_check_run(repo_full_name, head_sha, token, verdict, body)
+    print(f"Review e check postados: {verdict}")
 
 
 if __name__ == "__main__":
