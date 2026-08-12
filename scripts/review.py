@@ -9,6 +9,7 @@ from anthropic import Anthropic
 MODEL = "claude-sonnet-5"
 MAX_DIFF_CHARS = 80000
 MAX_CONVENTIONS_CHARS = 20000
+MAX_OUTPUT_TOKENS = 16000
 
 GITHUB_API = "https://api.github.com"
 CHECK_NAME = "ai-review"
@@ -92,13 +93,17 @@ def call_claude(prompt):
     client = Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
     message = client.messages.create(
         model=MODEL,
-        max_tokens=4096,
+        max_tokens=MAX_OUTPUT_TOKENS,
         messages=[{"role": "user", "content": prompt}],
     )
     raw_text = "".join(block.text for block in message.content if block.type == "text")
     match = re.search(r"\{.*\}", raw_text, re.DOTALL)
     if not match:
-        raise ValueError(f"Resposta do Claude sem JSON reconhecível: {raw_text}")
+        block_types = [block.type for block in message.content]
+        raise ValueError(
+            "Resposta do Claude sem JSON reconhecível. "
+            f"stop_reason={message.stop_reason!r} block_types={block_types!r} raw_text={raw_text!r}"
+        )
     return json.loads(match.group(0))
 
 
