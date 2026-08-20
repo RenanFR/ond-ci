@@ -7,7 +7,7 @@ import requests
 from anthropic import Anthropic
 
 MODEL = "claude-sonnet-5"
-MAX_DIFF_CHARS = 80000
+MAX_DIFF_CHARS = 300000
 MAX_CONVENTIONS_CHARS = 20000
 MAX_OUTPUT_TOKENS = 16000
 
