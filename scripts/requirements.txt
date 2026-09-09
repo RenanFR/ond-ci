@@ -1,2 +1,2 @@
-anthropic==0.121.0
+anthropic==1.4.0
 requests==2.34.2

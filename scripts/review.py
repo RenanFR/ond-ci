@@ -1,6 +1,5 @@
 import json
 import os
-import re
 import sys
 
 import requests
@@ -9,10 +8,35 @@ from anthropic import Anthropic
 MODEL = "claude-sonnet-5"
 MAX_DIFF_CHARS = 300000
 MAX_CONVENTIONS_CHARS = 20000
-MAX_OUTPUT_TOKENS = 16000
+MAX_OUTPUT_TOKENS = 64000
+REVIEW_ATTEMPTS = 2
 
 GITHUB_API = "https://api.github.com"
 CHECK_NAME = "ai-review"
+
+REVIEW_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "verdict": {"type": "string", "enum": ["APPROVE", "REQUEST_CHANGES"]},
+        "summary": {"type": "string"},
+        "findings": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "file": {"type": "string"},
+                    "line": {"type": "integer"},
+                    "severity": {"type": "string", "enum": ["blocking", "nit"]},
+                    "description": {"type": "string"},
+                },
+                "required": ["file", "line", "severity", "description"],
+                "additionalProperties": False,
+            },
+        },
+    },
+    "required": ["verdict", "summary", "findings"],
+    "additionalProperties": False,
+}
 
 
 def load_event():
@@ -59,16 +83,10 @@ def build_prompt(pull_request, diff, conventions):
         else "Nenhum CLAUDE.md encontrado no repositório.\n"
     )
     return f"""Você é um revisor de código rigoroso para o ecossistema OND (Agamatec).
-Revise o diff abaixo de um Pull Request e responda EXCLUSIVAMENTE com um JSON válido,
-sem markdown ao redor, no formato:
-
-{{
-  "verdict": "APPROVE" ou "REQUEST_CHANGES",
-  "summary": "resumo objetivo do parecer, em português, 2-4 frases",
-  "findings": [
-    {{"file": "caminho/do/arquivo", "line": 123, "severity": "blocking" ou "nit", "description": "..."}}
-  ]
-}}
+Revise o diff abaixo de um Pull Request. O resumo do parecer vai em "summary", em
+português, em 2 a 4 frases, e cada achado vira um item de "findings" com o caminho do
+arquivo, a linha e a severidade e a descrição. Use 0 na linha quando o achado não estiver
+preso a uma linha específica.
 
 Marque "verdict": "REQUEST_CHANGES" se houver QUALQUER achado com severity "blocking":
 - bug de corretude, condição de corrida, null/erro não tratado, regressão de comportamento
@@ -91,20 +109,28 @@ Diff:
 
 def call_claude(prompt):
     client = Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
-    message = client.messages.create(
-        model=MODEL,
-        max_tokens=MAX_OUTPUT_TOKENS,
-        messages=[{"role": "user", "content": prompt}],
-    )
-    raw_text = "".join(block.text for block in message.content if block.type == "text")
-    match = re.search(r"\{.*\}", raw_text, re.DOTALL)
-    if not match:
-        block_types = [block.type for block in message.content]
-        raise ValueError(
-            "Resposta do Claude sem JSON reconhecível. "
-            f"stop_reason={message.stop_reason!r} block_types={block_types!r} raw_text={raw_text!r}"
-        )
-    return json.loads(match.group(0))
+    last_failure = "nenhuma tentativa executada"
+    for attempt in range(1, REVIEW_ATTEMPTS + 1):
+        with client.messages.stream(
+            model=MODEL,
+            max_tokens=MAX_OUTPUT_TOKENS,
+            messages=[{"role": "user", "content": prompt}],
+            output_config={"format": {"type": "json_schema", "schema": REVIEW_SCHEMA}},
+        ) as stream:
+            message = stream.get_final_message()
+
+        raw_text = "".join(block.text for block in message.content if block.type == "text")
+        if not raw_text.strip():
+            block_types = [block.type for block in message.content]
+            last_failure = (
+                f"tentativa {attempt} terminou sem parecer escrito "
+                f"(stop_reason={message.stop_reason!r}, blocos recebidos={block_types!r})"
+            )
+            print(f"Revisão sem parecer utilizável, repetindo. {last_failure}", file=sys.stderr)
+            continue
+        return json.loads(raw_text)
+
+    raise ValueError(f"O Claude não devolveu um parecer utilizável. Última falha: {last_failure}")
 
 
 def format_review_body(review):
@@ -146,9 +172,7 @@ def submit_review(repo_full_name, pull_number, token, event, body):
     response.raise_for_status()
 
 
-def submit_check_run(repo_full_name, head_sha, token, verdict, body):
-    conclusion = "success" if verdict == "APPROVE" else "failure"
-    title = "Aprovado" if verdict == "APPROVE" else "Mudanças solicitadas"
+def submit_check_run(repo_full_name, head_sha, token, conclusion, title, body):
     url = f"{GITHUB_API}/repos/{repo_full_name}/check-runs"
     payload = {
         "name": CHECK_NAME,
@@ -176,16 +200,21 @@ def main():
 
     conventions = load_conventions()
     prompt = build_prompt(pull_request, diff, conventions)
-    review = call_claude(prompt)
 
-    verdict = review.get("verdict")
-    if verdict not in ("APPROVE", "REQUEST_CHANGES"):
-        print(f"Veredito inesperado do Claude: {verdict!r}, abortando sem postar review.")
+    try:
+        review = call_claude(prompt)
+    except Exception as review_failure:
+        reason = f"A revisão automática não foi concluída: {review_failure}"
+        print(reason, file=sys.stderr)
+        submit_check_run(repo_full_name, head_sha, token, "failure", "Revisão não concluída", reason)
         sys.exit(1)
 
+    verdict = review["verdict"]
     body = format_review_body(review)
+    conclusion = "success" if verdict == "APPROVE" else "failure"
+    title = "Aprovado" if verdict == "APPROVE" else "Mudanças solicitadas"
     submit_review(repo_full_name, pull_number, token, verdict, body)
-    submit_check_run(repo_full_name, head_sha, token, verdict, body)
+    submit_check_run(repo_full_name, head_sha, token, conclusion, title, body)
     print(f"Review e check postados: {verdict}")
 
 
